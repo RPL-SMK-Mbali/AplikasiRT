@@ -1,0 +1,520 @@
+// ============================================================
+// KAS RT ONLINE — Skema Database (MySQL 8 / Prisma)
+// Modul: Saldo Awal & Periode Akuntansi + Manajemen Rapat RT
+//
+// CARA PAKAI di PC Anda:
+//   1. Salin file ini menimpa schema.prisma:
+//        cp prisma/schema.mysql.prisma prisma/schema.prisma
+//   2. Isi DATABASE_URL di .env (lihat deploy/env.example)
+//   3. npx prisma generate && npx prisma db push
+//
+// Catatan teknis:
+// - Kolom teks panjang (JSON snapshot, isi notulen, deskripsi)
+//   diberi anotasi @db.Text / @db.LongText karena default
+//   VARCHAR(191) Prisma terlalu kecil untuk MySQL.
+// - Kolom unik tetap VARCHAR(191) agar aman untuk indeks.
+// - Nominal uang memakai DOUBLE (setara Float di SQLite).
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------------
+// CORE: Pengguna, Warga, Pengaturan, Notifikasi, Audit Log
+// ------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  email        String?   @unique
+  name         String
+  passwordHash String
+  role         String    // ADMIN | KETUA | SEKRETARIS | BENDAHARA | WARGA
+  isActive     Boolean   @default(true)
+  residentId   String?   @unique
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  resident             Resident?              @relation("UserResident", fields: [residentId], references: [id])
+  notifications        Notification[]
+  auditLogs            AuditLog[]
+  transactionsCreated  Transaction[]          @relation("TransactionCreator")
+  transactionsPosted   Transaction[]          @relation("TransactionPoster")
+  openingBalancesCreated OpeningBalance[]     @relation("OpeningBalanceCreator")
+  openingBalancesApproved OpeningBalance[]    @relation("OpeningBalanceApprover")
+  periodsCreated       AccountingPeriod[]     @relation("PeriodCreator")
+  periodsLocked        AccountingPeriod[]     @relation("PeriodLocker")
+  periodsReopened      AccountingPeriod[]     @relation("PeriodReopener")
+  reconciliationsChecked CashReconciliation[] @relation("ReconciliationChecker")
+  reconciliationsApproved CashReconciliation[] @relation("ReconciliationApprover")
+  paymentsRecorded     Payment[]              @relation("PaymentRecorder")
+  meetingsCreated      Meeting[]              @relation("MeetingCreator")
+  invitationsCreated   MeetingInvitation[]    @relation("InvitationCreator")
+  invitationsApproved  MeetingInvitation[]    @relation("InvitationApprover")
+  attendanceVerified   MeetingAttendance[]    @relation("AttendanceVerifier")
+  minutesPrepared      MeetingMinutes[]       @relation("MinutesPreparer")
+  minutesReviewed      MeetingMinutes[]       @relation("MinutesReviewer")
+  minutesApproved      MeetingMinutes[]       @relation("MinutesApprover")
+  actionItemsAssigned  MeetingActionItem[]    @relation("ActionItemAssignee")
+  actionItemsCreated   MeetingActionItem[]    @relation("ActionItemCreator")
+  actionItemsVerified  MeetingActionItem[]    @relation("ActionItemVerifier")
+  attachmentsUploaded  MeetingAttachment[]    @relation("AttachmentUploader")
+}
+
+model Resident {
+  id             String   @id @default(cuid())
+  fullName       String
+  houseNumber    String
+  noKK           String?
+  phone          String?
+  isHeadOfFamily Boolean  @default(true)
+  familyRelation String?  // KEPALA_KELUARGA | ISTRI | ANAK | LAINNYA
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user           User?                 @relation("UserResident")
+  payments       Payment[]
+  attendances    MeetingAttendance[]
+  actionItems    MeetingActionItem[]   @relation("ActionItemResponsibleResident")
+}
+
+model AppSetting {
+  id        String   @id @default("singleton")
+  // Identitas RT (JSON string: namaRT, nomorRT, nomorRW, desa, ketuaName, sekretarisName, alamat, etc.)
+  data      String   @db.Text
+  updatedAt DateTime @updatedAt
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String   // UNDANGAN_BARU | PERUBAHAN_JADWAL | PEMBATALAN_RAPAT | NOTULEN_DITERBITKAN | TUGAS_BARU | TUGAS_TENGGAT | PERIODE_INFO | REKONSILIASI_SELISIH | INFO
+  title     String
+  body      String   @db.Text
+  link      String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  userId      String?
+  userName    String?  // snapshot nama agar tetap terbaca jika user dihapus
+  action      String   // CREATE | UPDATE | DELETE | APPROVE | LOCK | REOPEN | POST | CANCEL | REVERSE | PUBLISH | EXPORT | LOGIN | dll
+  objectType  String   // OPENING_BALANCE | ACCOUNTING_PERIOD | TRANSACTION | MEETING | ...
+  objectId    String?
+  description String   @db.Text
+  beforeData  String?  @db.Text // JSON nilai sebelum
+  afterData   String?  @db.Text // JSON nilai sesudah
+  createdAt   DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([objectType, objectId])
+  @@index([createdAt])
+}
+
+// ------------------------------------------------------------
+// MODUL I: SALDO AWAL & PERIODE AKUNTANSI
+// ------------------------------------------------------------
+
+model OpeningBalance {
+  id                   String    @id @default(cuid())
+  openingBalanceNumber String    @unique
+  effectiveDate        DateTime
+  amount               Float
+  description          String    @db.Text
+  sourceType           String    // PEMBUKUAN_SEBELUMNYA | MIGRASI_MANUAL | LAINNYA
+  supportingDocument   String?   @db.Text
+  status               String    @default("DRAFT") // DRAFT | APPROVED | LOCKED
+  cashAccountId        String?
+  createdById          String
+  approvedById         String?
+  approvedAt           DateTime?
+  lockedAt             DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  createdBy        User         @relation("OpeningBalanceCreator", fields: [createdById], references: [id])
+  approvedBy       User?        @relation("OpeningBalanceApprover", fields: [approvedById], references: [id])
+  cashAccount      CashAccount? @relation(fields: [cashAccountId], references: [id])
+  corrections      OpeningBalanceCorrection[]
+}
+
+// Koreksi saldo awal: catat nominal lama/baru, alasan, pihak penyetuju
+model OpeningBalanceCorrection {
+  id               String   @id @default(cuid())
+  openingBalanceId String
+  oldAmount        Float
+  newAmount        Float
+  reason           String   @db.Text
+  approvedById     String?
+  createdAt        DateTime @default(now())
+
+  openingBalance OpeningBalance @relation(fields: [openingBalanceId], references: [id])
+}
+
+model AccountingPeriod {
+  id             String    @id @default(cuid())
+  periodCode     String    @unique // 2026-10
+  periodName     String    // Oktober 2026
+  startDate      DateTime
+  endDate        DateTime
+  status         String    @default("OPEN") // OPEN | REVIEW | CLOSED | LOCKED
+  openingBalance Float     @default(0) // snapshot kalkulasi
+  totalIncome    Float     @default(0) // snapshot kalkulasi
+  totalExpense   Float     @default(0) // snapshot kalkulasi
+  closingBalance Float     @default(0) // snapshot kalkulasi
+  lockedAt       DateTime?
+  lockedById     String?
+  reopenedAt     DateTime?
+  reopenedById   String?
+  reopenReason   String?   @db.Text
+  createdById    String
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  createdBy   User                  @relation("PeriodCreator", fields: [createdById], references: [id])
+  lockedBy    User?                 @relation("PeriodLocker", fields: [lockedById], references: [id])
+  reopenedBy  User?                 @relation("PeriodReopener", fields: [reopenedById], references: [id])
+  snapshots   AccountingPeriodSnapshot[]
+  adjustments AccountingPeriodAdjustment[]
+}
+
+model AccountingPeriodSnapshot {
+  id          String   @id @default(cuid())
+  periodId    String
+  snapshotAt  DateTime @default(now())
+  data        String   @db.LongText // JSON snapshot lengkap
+  createdById String?
+
+  period AccountingPeriod @relation(fields: [periodId], references: [id])
+}
+
+// Koreksi transaksi terlambat / lintas periode (histori terjaga)
+model AccountingPeriodAdjustment {
+  id                    String   @id @default(cuid())
+  periodId              String   // periode koreksi
+  sourcePeriodId        String?  // periode asal transaksi
+  originalTransactionId String?
+  description           String   @db.Text
+  amount                Float
+  reason                String   @db.Text
+  approvedById          String?
+  createdAt             DateTime @default(now())
+
+  period             AccountingPeriod @relation(fields: [periodId], references: [id])
+  originalTransaction Transaction?     @relation("AdjustmentOriginalTransaction", fields: [originalTransactionId], references: [id])
+}
+
+model CashAccount {
+  id        String   @id @default(cuid())
+  name      String
+  type      String   // KAS | BANK
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions    Transaction[]
+  transfersFrom   CashTransfer[] @relation("TransferFrom")
+  transfersTo     CashTransfer[] @relation("TransferTo")
+  reconciliations CashReconciliation[]
+  openingBalances OpeningBalance[]
+}
+
+model Transaction {
+  id              String    @id @default(cuid())
+  trxNumber       String    @unique
+  type            String    // OPENING | INCOME | EXPENSE | TRANSFER_IN | TRANSFER_OUT
+  category        String?   // IURAN_BULANAN | DONASI | KEGIATAN | OPERASIONAL | dll
+  amount          Float
+  transactionDate DateTime
+  description     String    @db.Text
+  cashAccountId   String?
+  status          String    @default("DRAFT") // DRAFT | POSTED | CANCELLED | REVERSED
+  isTransfer      Boolean   @default(false)
+  paymentId       String?   @unique
+  reversedById    String?   @unique // transaksi pembalik
+  reversalReason  String?   @db.Text
+  postedAt        DateTime?
+  postedById      String?
+  createdById     String
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  cashAccount        CashAccount?                  @relation(fields: [cashAccountId], references: [id])
+  createdBy          User                          @relation("TransactionCreator", fields: [createdById], references: [id])
+  postedBy           User?                         @relation("TransactionPoster", fields: [postedById], references: [id])
+  reversalOf         Transaction?                  @relation("TransactionReversal", fields: [reversedById], references: [id])
+  reversedByThis     Transaction?                  @relation("TransactionReversal")
+  payment            Payment?                      @relation("PaymentTransaction")
+  adjustments        AccountingPeriodAdjustment[]  @relation("AdjustmentOriginalTransaction")
+}
+
+model CashTransfer {
+  id            String   @id @default(cuid())
+  fromAccountId String
+  toAccountId   String
+  amount        Float
+  transferDate  DateTime
+  description   String   @db.Text
+  trxOutId      String?  @unique
+  trxInId       String?  @unique
+  createdById   String
+  createdAt     DateTime @default(now())
+
+  fromAccount CashAccount @relation("TransferFrom", fields: [fromAccountId], references: [id])
+  toAccount   CashAccount @relation("TransferTo", fields: [toAccountId], references: [id])
+}
+
+model FeeType {
+  id        String   @id @default(cuid())
+  name      String   // Iuran Bulanan, Iuran Keamanan, dll
+  amount    Float
+  frequency String   @default("BULANAN") // BULANAN | TAHUNAN | SEKALI
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments Payment[]
+}
+
+model Payment {
+  id            String    @id @default(cuid())
+  residentId    String
+  feeTypeId     String
+  periodCode    String    // periode iuran 2026-10
+  amount        Float
+  status        String    @default("PAID") // PAID
+  paidAt        DateTime
+  transactionId String?   @unique
+  notes         String?   @db.Text
+  recordedById  String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  resident    Resident     @relation(fields: [residentId], references: [id])
+  feeType     FeeType      @relation(fields: [feeTypeId], references: [id])
+  transaction Transaction? @relation("PaymentTransaction", fields: [transactionId], references: [id])
+  recordedBy  User         @relation("PaymentRecorder", fields: [recordedById], references: [id])
+
+  @@unique([residentId, feeTypeId, periodCode])
+}
+
+model CashReconciliation {
+  id            String    @id @default(cuid())
+  reconcileDate DateTime
+  cashAccountId String
+  systemBalance Float
+  actualBalance Float
+  difference    Float
+  notes         String?   @db.Text
+  supportingDoc String?   @db.Text
+  checkedById   String?
+  approvedById  String?
+  status        String    @default("PERLU_PENJELASAN") // COCOK | SELISIH | PERLU_PENJELASAN | SELESAI
+  resolvedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  cashAccount CashAccount @relation(fields: [cashAccountId], references: [id])
+  checkedBy   User?       @relation("ReconciliationChecker", fields: [checkedById], references: [id])
+  approvedBy  User?       @relation("ReconciliationApprover", fields: [approvedById], references: [id])
+}
+
+// ------------------------------------------------------------
+// MODUL II: MANAJEMEN RAPAT RT
+// ------------------------------------------------------------
+
+model Meeting {
+  id            String    @id @default(cuid())
+  meetingNumber String    @unique // RTM/2026/001
+  title         String
+  meetingType   String    // RUTIN | PENGURUS | WARGA | PERSIAPAN_KEGIATAN | KEAMANAN_KEBERSIHAN | PEMBANGUNAN | SOSIAL | KHUSUS | LAINNYA
+  meetingDate   DateTime
+  startTime     String    // "19:00"
+  endTime       String?   // "21:00"
+  location      String
+  meetingMethod String    @default("LURING") // LURING | DARING | HYBRID
+  description   String?   @db.Text
+  status        String    @default("SCHEDULED") // SCHEDULED | COMPLETED | CANCELLED
+  cancelReason  String?   @db.Text
+  createdById   String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  createdBy   User                    @relation("MeetingCreator", fields: [createdById], references: [id])
+  invitation  MeetingInvitation?
+  agendas     MeetingAgenda[]
+  attendances MeetingAttendance[]
+  minutes     MeetingMinutes?
+  decisions   MeetingDecision[]
+  actionItems MeetingActionItem[]
+  attachments MeetingAttachment[]
+}
+
+model MeetingInvitation {
+  id                String    @id @default(cuid())
+  meetingId         String    @unique
+  invitationNumber  String    @unique // UND/RT05/2026/001
+  invitationContent String    @db.Text
+  participantScope  String    // SEMUA_WARGA | SEMUA_KK | PENGURUS | KELOMPOK | PILIHAN
+  scopeDescription  String?   @db.Text
+  invitationDate    DateTime
+  responseDeadline  DateTime?
+  status            String    @default("DRAFT") // DRAFT | PENDING_APPROVAL | PUBLISHED | COMPLETED | CANCELLED | ARCHIVED
+  changeNotes       String?   @db.Text
+  createdById       String
+  approvedById      String?
+  approvedAt        DateTime?
+  publishedAt       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  meeting    Meeting @relation(fields: [meetingId], references: [id])
+  createdBy  User    @relation("InvitationCreator", fields: [createdById], references: [id])
+  approvedBy User?   @relation("InvitationApprover", fields: [approvedById], references: [id])
+}
+
+model MeetingAgenda {
+  id          String  @id @default(cuid())
+  meetingId   String
+  order       Int
+  title       String
+  description String? @db.Text
+
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+
+  @@index([meetingId])
+}
+
+// Sumber kebenaran TUNGGAL untuk konfirmasi & kehadiran per warga per rapat
+model MeetingAttendance {
+  id               String    @id @default(cuid())
+  meetingId        String
+  residentId       String
+  responseStatus   String    @default("BELUM_MERESPONS") // BELUM_MERESPONS | HADIR | TIDAK_HADIR | BELUM_PASTI
+  responseAt       DateTime?
+  attendanceStatus String    @default("BELUM_DICATAT") // BELUM_DICATAT | HADIR | TIDAK_HADIR | IZIN
+  attendanceTime   DateTime?
+  attendanceMethod String?   // MANUAL | WA | LAINNYA
+  notes            String?   @db.Text
+  verifiedById     String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  meeting    Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  resident   Resident @relation(fields: [residentId], references: [id])
+  verifiedBy User?    @relation("AttendanceVerifier", fields: [verifiedById], references: [id])
+
+  @@unique([meetingId, residentId])
+  @@index([residentId])
+}
+
+model MeetingMinutes {
+  id                String    @id @default(cuid())
+  meetingId         String    @unique
+  minutesNumber     String    @unique // NTR/RT05/2026/001
+  chairperson       String
+  minuteTaker       String
+  attendeesCount    Int       @default(0)
+  agendaSummary     String?   @db.Text
+  discussionSummary String?   @db.Text
+  closingNotes      String?   @db.Text
+  documentStatus    String    @default("DRAFT") // DRAFT | PENDING_REVIEW | APPROVED | PUBLISHED | ARCHIVED
+  version           Int       @default(1)
+  preparedById      String
+  reviewedById      String?
+  approvedById      String?
+  approvedAt        DateTime?
+  publishedAt       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  meeting    Meeting @relation(fields: [meetingId], references: [id])
+  preparedBy User    @relation("MinutesPreparer", fields: [preparedById], references: [id])
+  reviewedBy User?   @relation("MinutesReviewer", fields: [reviewedById], references: [id])
+  approvedBy User?   @relation("MinutesApprover", fields: [approvedById], references: [id])
+  versions   MeetingDocumentVersion[]
+  decisions  MeetingDecision[]
+}
+
+model MeetingDecision {
+  id        String   @id @default(cuid())
+  meetingId String
+  minutesId String?
+  order     Int
+  decision  String   @db.Text
+  isPublic  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  meeting     Meeting             @relation(fields: [meetingId], references: [id])
+  minutes     MeetingMinutes?     @relation(fields: [minutesId], references: [id])
+  actionItems MeetingActionItem[]
+}
+
+model MeetingActionItem {
+  id                    String    @id @default(cuid())
+  meetingId             String
+  decisionId            String?
+  title                 String
+  description           String?   @db.Text
+  responsibleUserId     String?
+  responsibleResidentId String?
+  startDate             DateTime?
+  dueDate               DateTime?
+  priority              String    @default("NORMAL") // LOW | NORMAL | HIGH | URGENT
+  status                String    @default("NOT_STARTED") // NOT_STARTED | IN_PROGRESS | COMPLETED | CANCELLED
+  completionNotes       String?   @db.Text
+  completedAt           DateTime?
+  verifiedById          String?
+  createdById           String
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  meeting              Meeting   @relation(fields: [meetingId], references: [id])
+  decision             MeetingDecision? @relation(fields: [decisionId], references: [id])
+  responsibleUser      User?     @relation("ActionItemAssignee", fields: [responsibleUserId], references: [id])
+  responsibleResident  Resident? @relation("ActionItemResponsibleResident", fields: [responsibleResidentId], references: [id])
+  createdBy            User      @relation("ActionItemCreator", fields: [createdById], references: [id])
+  verifiedBy           User?     @relation("ActionItemVerifier", fields: [verifiedById], references: [id])
+}
+
+model MeetingAttachment {
+  id           String   @id @default(cuid())
+  meetingId    String
+  type         String   // UNDANGAN | NOTULEN | DAFTAR_HADIR | FOTO | MATERI | LAMPIRAN_KEPUTUSAN | BUKTI_TINDAK_LANJUT | LAINNYA
+  fileName     String
+  filePath     String   @db.Text
+  mimeType     String
+  fileSize     Int
+  isPublic     Boolean  @default(false)
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  meeting    Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  uploadedBy User    @relation("AttachmentUploader", fields: [uploadedById], references: [id])
+}
+
+model MeetingDocumentVersion {
+  id           String   @id @default(cuid())
+  minutesId    String
+  version      Int
+  data         String   @db.LongText // JSON snapshot isi notulen sebelum perubahan
+  changeReason String?  @db.Text
+  changedById  String?
+  createdAt    DateTime @default(now())
+
+  minutes MeetingMinutes @relation(fields: [minutesId], references: [id])
+}

@@ -1,0 +1,48 @@
+# ============================================================
+# KAS RT ONLINE — Service systemd (Linux)
+#
+# Cara pakai:
+#   1. Pastikan aplikasi sudah dibuild di /opt/kas-rt
+#      (sesuaikan path di bawah jika berbeda)
+#   2. Edit Environment=DATABASE_URL sesuai kredensial MySQL Anda
+#   3. sudo cp kas-rt.service /etc/systemd/system/
+#   4. sudo systemctl daemon-reload
+#   5. sudo systemctl enable --now kas-rt
+#   6. Cek status: systemctl status kas-rt
+#      Log:        journalctl -u kas-rt -f
+# ============================================================
+
+[Unit]
+Description=Kas RT Online (Next.js production server)
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+# Ganti dengan user non-root milik Anda, mis. User=budi
+User=www-data
+Group=www-data
+
+# Direktori hasil build standalone Next.js
+WorkingDirectory=/opt/kas-rt/.next/standalone
+
+# Jalankan server dengan Node (tanpa butuh bun)
+ExecStart=/usr/bin/node /opt/kas-rt/.next/standalone/server.js
+
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+# >>> GANTI dengan kredensial MySQL Anda <<<
+Environment=DATABASE_URL=mysql://kasrt:GANTI_PASSWORD@127.0.0.1:3306/kas_rt
+
+# Startup & resiliensi
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+
+# Hardening ringan
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
